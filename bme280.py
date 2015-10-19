@@ -27,7 +27,7 @@ from collections import namedtuple
 import smbus
 
 # Oversampling mode
-_DEFAULT_ADDRESS = 0x77
+_DEFAULT_ADDRESS = 0x76
 OS_MODE_SINGLE = 0b00
 OS_MODE_2      = 0b01
 OS_MODE_4      = 0b10
@@ -208,6 +208,9 @@ class Bme280(sensorbase.SensorBase):
             self._pressure,
             self._temperature
         )
+
+    def read_all(self):
+        return self.all()
 
     def all(self):
         self._update()
