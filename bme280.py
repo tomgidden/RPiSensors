@@ -20,23 +20,51 @@ with the intention of providing BME280 data through an interface similar
 to that of the bmp180.py library
 """
 
+import time
 import sensorbase
 import argparse
 from collections import namedtuple
 
 import smbus
 
-# Oversampling mode
-_DEFAULT_ADDRESS = 0x76
-OS_MODE_SINGLE = 0b00
-OS_MODE_2      = 0b01
-OS_MODE_4      = 0b10
-OS_MODE_8      = 0b11
-
 class Bme280(sensorbase.SensorBase):
+    DEFAULT_ADDRESS = 0x76
 
-    def __init__(self, bus = None, addr = _DEFAULT_ADDRESS,
-                 os_mode = OS_MODE_SINGLE):
+    OS_MODE_0      = 0b000
+    OS_MODE_1      = 0b001
+    OS_MODE_2      = 0b010
+    OS_MODE_4      = 0b011
+    OS_MODE_8      = 0b100
+    OS_MODE_16     = 0b101
+
+    MODE_SLEEP     = 0b00
+    MODE_FORCED    = 0b01
+    MODE_NORMAL    = 0b11
+
+    FILTER_OFF     = 0b000
+    FILTER_2       = 0b001
+    FILTER_4       = 0b010
+    FILTER_8       = 0b011
+    FILTER_16      = 0b100
+
+    STANDBY_HALFMS = 0b000
+    STANDBY_62p5MS = 0b001
+    STANDBY_125MS  = 0b010
+    STANDBY_250MS  = 0b011
+    STANDBY_500MS  = 0b100
+    STANDBY_1000MS = 0b101
+    STANDBY_10MS   = 0b110
+    STANDBY_20MS   = 0b111
+
+    def __init__(self,
+                 bus = None,
+                 addr = DEFAULT_ADDRESS,
+                 pressure_os = OS_MODE_16,
+                 humidity_os = OS_MODE_1,
+                 temperature_os = OS_MODE_2,
+                 mode = MODE_FORCED,
+                 standby = STANDBY_1000MS,
+                 filter = FILTER_16):
 
         assert(bus is not None)
         assert(addr > 0b000111 and addr < 0b1111000)
@@ -46,70 +74,60 @@ class Bme280(sensorbase.SensorBase):
 
         self._bus = bus
         self._addr = addr
-        self._os_mode = os_mode
+        self._mode = mode
+        self._filter = filter
+        self._t_sb = standby
 
-        self._osrs_t = 1  # Temperature oversampling x 1
-        self._osrs_p = 1  # Pressure oversampling x 1
-        self._osrs_h = 1  # Humidity oversampling x 1
-        self._mode = 3  # Normal mode
-        self._t_sb = 5  # Tstandby 1000ms
-        self._filter = 0  # Filter off
+        self._osrs_t = temperature_os
+        self._osrs_p = pressure_os
+        self._osrs_h = humidity_os
+
         self._spi3w_en = 0  # 3-wire SPI Disable
 
-        self._pressure = None
-        self._temperature = None
-        self._humidity = None
+        self._reset()
+        self._reset_calibration()
 
-        self._calibration_h = []
-        self._calibration_p = []
-        self._calibration_t = []
-        self._t_fine = 0.0
-
-        self._ctrl_meas_reg = (self._osrs_t << 5) | (self._osrs_p << 2) | self._mode
-        self._config_reg = (self._t_sb << 5) | (self._filter << 2) | self._spi3w_en
-        self._ctrl_hum_reg = self._osrs_h
-
-        self._read_calibration_data()
-
-    @property
-    def os_mode(self):
-        '''Gets/Sets oversampling mode.
-
-        OS_MODE_SINGLE: Single mode.
-        OS_MODE_2: 2 times.
-        OS_MODE_4: 4 times.
-        OS_MODE_8: 8 times.
-
-        '''
-        return (self._os_mode)
-
-    @os_mode.setter
-    def os_mode(self, os_mode):
-        assert(os_mode == OS_MODE_SINGLE
-               or os_mode == OS_MODE_2
-               or os_mode == OS_MODE_4
-               or os_mode == OS_MODE_8)
-        self._os_mode = os_mode
+    def _reset(self):
+        self._bus.write_byte_data(self._addr, 0xE0, 0xB6)
+        time.sleep(0.005)
 
     def _reset_calibration(self):
         self._calibration_h = []
         self._calibration_p = []
         self._calibration_t = []
         self._t_fine = 0.0
+
+        # Compile configuration registers
+        ctrl_meas_reg = (self._osrs_t << 5) | (self._osrs_p << 2) | self._mode
+        config_reg    = (self._t_sb << 5) | (self._filter << 2) | self._spi3w_en
+        ctrl_hum_reg  = self._osrs_h
+
+        # Set configuration registers
         self._bus.write_byte_data(self._addr, 0xF2, ctrl_hum_reg)
         self._bus.write_byte_data(self._addr, 0xF4, ctrl_meas_reg)
         self._bus.write_byte_data(self._addr, 0xF5, config_reg)
 
-    def _read_calibration_data(self):
+        # Needs some time after setting the registers before the data is available.
+        # The quickest (no filter, no oversample) seems to be about 3ms
+
+        status = 0b1001
+        while status:
+            status = self._bus.read_byte_data(self._addr, 0xF3) & 0b1001
+            time.sleep(0.003)
+
+        # Okay, ready to get the calibration data
         calib = []
 
-        calib.extend(self._bus.read_i2c_block_data(self._addr, 0x88, 24))
-        calib.extend(self._bus.read_i2c_block_data(self._addr, 0xA1, 1))
-        calib.extend(self._bus.read_i2c_block_data(self._addr, 0xE1, 7))
+        # Load calibration data registers from the three memory ranges
+        calib.extend(self._bus.read_i2c_block_data(self._addr, 0x88, 24)) # calib0-24
+        calib.extend(self._bus.read_i2c_block_data(self._addr, 0xA1, 1))  # calib25
+        calib.extend(self._bus.read_i2c_block_data(self._addr, 0xE1, 7))  # calib26-
 
+        # Reorganise as the data types specified in the datasheet
         self._calibration_t.append((calib[1] << 8) | calib[0])
         self._calibration_t.append((calib[3] << 8) | calib[2])
         self._calibration_t.append((calib[5] << 8) | calib[4])
+
         self._calibration_p.append((calib[7] << 8) | calib[6])
         self._calibration_p.append((calib[9] << 8) | calib[8])
         self._calibration_p.append((calib[11] << 8) | calib[10])
@@ -119,6 +137,7 @@ class Bme280(sensorbase.SensorBase):
         self._calibration_p.append((calib[19] << 8) | calib[18])
         self._calibration_p.append((calib[21] << 8) | calib[20])
         self._calibration_p.append((calib[23] << 8) | calib[22])
+
         self._calibration_h.append(calib[24])
         self._calibration_h.append((calib[26] << 8) | calib[25])
         self._calibration_h.append(calib[27])
@@ -192,15 +211,29 @@ class Bme280(sensorbase.SensorBase):
         return var_h
 
     def _update_sensor_data(self):
+
+        # Wait for sensor data to become fully available
+        status = 0b1001
+        while status:
+            status = self._bus.read_byte_data(self._addr, 0xF3) & 0b1001
+            time.sleep(0.003)
+
+        # Read raw data in one go
+        #
+        # XXX: It just occurred to me that I don't know if this is a burst read
+        # XXX: which is a requirement for the data to be consistent. Oh well, if
+        # XXX: worried about this, look at "Data register shadowing" section of
+        # XXX: BME280 datasheet
         data = self._bus.read_i2c_block_data(self._addr, 0xF7, 8)
 
-        self._pres_raw = (data[0] << 12) | (data[1] << 4) | (data[2] >> 4)
-        self._temp_raw = (data[3] << 12) | (data[4] << 4) | (data[5] >> 4)
-        self._hum_raw = (data[6] << 8) | data[7]
+        pres_raw = (data[0] << 12) | (data[1] << 4) | (data[2] >> 4)
+        temp_raw = (data[3] << 12) | (data[4] << 4) | (data[5] >> 4)
+        hum_raw = (data[6] << 8) | data[7]
 
-        self._temperature = self._compensate_temperature(self._temp_raw)
-        self._pressure = self._compensate_pressure(self._pres_raw)
-        self._humidity = self._compensate_humidity(self._hum_raw)
+        # Apply compensation routines as described in the datasheet
+        self._temperature = self._compensate_temperature(temp_raw)
+        self._pressure = self._compensate_pressure(pres_raw)
+        self._humidity = self._compensate_humidity(hum_raw)
 
     def pressure_and_temperature(self):
         self._update()
